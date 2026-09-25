@@ -1,0 +1,41 @@
+# Build trees
+/build/
+/build-*/
+/out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+*.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+CTestTestfile.cmake
+
+# Editor / tooling
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Runtime state produced by icfd / icfclusterd
+*.icflog
+*.icfsnap
+*.ready
+/run/
+/state/
+/tmp/
+*.log
+
+# Object files
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.so
+*.dylib
+*.exe
