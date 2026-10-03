@@ -26,8 +26,7 @@ project you agree that:
 * C++20, CMake 3.20 or newer. Builds must be warning-clean at the project warning level
   (`/W4` on MSVC, `-Wall -Wextra -Wpedantic` elsewhere).
 * Every behavioral claim in a pull request must be backed by a test that runs by default in
-  the test suite. Do not add CTest `TIMEOUT` properties or shell timeouts: a hang is a
-  defect to be diagnosed, not masked.
+  the test suite.
 * Do not add new runtime dependencies on third-party code without discussing it first. The
   runtime deliberately depends only on the C++ standard library and the platform socket API.
 * Keep the adjacent-runtime boundary explicit: ICF owns cross-cluster connectivity
