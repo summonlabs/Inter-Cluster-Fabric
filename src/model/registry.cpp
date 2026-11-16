@@ -1,6 +1,9 @@
 #include "icf/model/registry.hpp"
 
 #include <algorithm>
+#include <set>
+#include <utility>
+#include <vector>
 
 #include "icf/core/checked.hpp"
 #include "icf/core/limits.hpp"
@@ -18,6 +21,65 @@ Status insert_bounded(Map& map, Key key, Record record, std::size_t bound, const
   }
   map[key] = std::move(record);
   return Status::ok();
+}
+
+// Every grant stays in its table after it has ended, and every reservation after its release.
+// Without a way out, a table fills with that history and then refuses every new record for good.
+// When a table is full, the oldest part of its history makes room. A grant that is live, a grant
+// that still holds a reservation, and a reservation that is not released are never discarded.
+bool grant_finished(GrantState state) noexcept {
+  return state == GrantState::Fenced || state == GrantState::Aborted || state == GrantState::Expired ||
+         state == GrantState::Withdrawn;
+}
+
+void discard_grant_history(std::map<GrantId, GrantRecord>& grants,
+                           std::map<ReservationId, ReservationRecord>& reservations) {
+  std::set<GrantId> holding;
+  for (const auto& entry : reservations) {
+    if (!entry.second.released) {
+      holding.insert(entry.second.grant);
+    }
+  }
+  std::vector<std::pair<Timestamp, GrantId>> history;
+  for (const auto& entry : grants) {
+    if (grant_finished(entry.second.state) && holding.count(entry.first) == 0) {
+      history.emplace_back(entry.second.issued_at, entry.first);
+    }
+  }
+  std::sort(history.begin(), history.end());
+  const std::size_t batch = limits::kMaxGrants / 8;
+  if (history.size() > batch) {
+    history.resize(batch);
+  }
+  std::set<GrantId> discarded;
+  for (const auto& entry : history) {
+    grants.erase(entry.second);
+    discarded.insert(entry.second);
+  }
+  for (auto it = reservations.begin(); it != reservations.end();) {
+    if (discarded.count(it->second.grant) != 0) {
+      it = reservations.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void discard_reservation_history(std::map<ReservationId, ReservationRecord>& reservations) {
+  std::vector<std::pair<Timestamp, ReservationId>> history;
+  for (const auto& entry : reservations) {
+    if (entry.second.released) {
+      history.emplace_back(entry.second.released_at, entry.first);
+    }
+  }
+  std::sort(history.begin(), history.end());
+  const std::size_t batch = limits::kMaxReservations / 8;
+  if (history.size() > batch) {
+    history.resize(batch);
+  }
+  for (const auto& entry : history) {
+    reservations.erase(entry.second);
+  }
 }
 
 }  // namespace
@@ -269,6 +331,9 @@ Status Registry::put_grant(GrantRecord record) {
     return Status::make(Outcome::Overflow, "grant capacity exceeds the maximum");
   }
   const GrantId key = record.id;
+  if (grants_.size() >= limits::kMaxGrants && grants_.find(key) == grants_.end()) {
+    discard_grant_history(grants_, reservations_);
+  }
   return insert_bounded(grants_, key, std::move(record), limits::kMaxGrants, "grant");
 }
 
@@ -291,6 +356,9 @@ Status Registry::put_reservation(ReservationRecord record) {
     return invalid("reservation requires an identity");
   }
   const ReservationId key = record.id;
+  if (reservations_.size() >= limits::kMaxReservations && reservations_.find(key) == reservations_.end()) {
+    discard_reservation_history(reservations_);
+  }
   return insert_bounded(reservations_, key, std::move(record), limits::kMaxReservations, "reservation");
 }
 

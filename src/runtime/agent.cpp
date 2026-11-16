@@ -1140,15 +1140,26 @@ Status Agent::on_status_request(const wire::Frame& frame) {
   report.generation = generation_;
   report.policy_generation = policy_generation_;
   report.agent_term = term_;
+  // The agent keeps a record of every grant it ever prepared. Only a grant it may still enforce,
+  // or is in the middle of installing, is reported: one that ended here tells the coordinator
+  // nothing, and the whole history does not fit one frame. A report that cannot be sent closes
+  // the connection, and it would close every connection after it too.
+  constexpr std::size_t kEntryBytes = 96;  // identity, attempt, state, term, and digest of one entry
+  const std::size_t most = (limits::kMaxFramePayload - 1024) / kEntryBytes;
   for (const auto& entry : registry_.grants()) {
+    const model::GrantState state = entry.second.state;
+    if (state == model::GrantState::Fenced || state == model::GrantState::Aborted ||
+        state == model::GrantState::Expired || state == model::GrantState::Withdrawn) {
+      continue;
+    }
     wire::GrantStatusEntry status;
     status.grant = entry.second.id;
     status.attempt = entry.second.attempt;
-    status.state = entry.second.state;
+    status.state = state;
     status.agent_term = entry.second.coordinator_term;
     status.enforcement_digest = entry.second.enforcement_digest[0];
     report.grants.push_back(status);
-    if (report.grants.size() >= limits::kMaxGrants) {
+    if (report.grants.size() >= most) {
       break;
     }
   }

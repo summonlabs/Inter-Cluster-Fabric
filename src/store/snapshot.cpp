@@ -13,6 +13,11 @@ namespace {
 constexpr std::array<std::byte, 8> kSnapshotMagic{std::byte{'I'}, std::byte{'C'}, std::byte{'F'}, std::byte{'S'},
                                                   std::byte{'N'}, std::byte{'P'}, std::byte{'1'}, std::byte{0}};
 
+// A snapshot holds the whole registry, audit trail included, so it is bounded by the size of the
+// store and not by the size of one log record: a registry of ordinary size is many times larger
+// than a single record.
+constexpr std::size_t kMaxSnapshotPayload = static_cast<std::size_t>(limits::kMaxStoreBytes);
+
 void put_u16(std::byte* out, std::uint16_t value) {
   out[0] = static_cast<std::byte>((value >> 8) & 0xFFu);
   out[1] = static_cast<std::byte>(value & 0xFFu);
@@ -55,8 +60,8 @@ std::uint64_t get_u64(const std::byte* in) {
 Result<std::vector<std::byte>> encode_snapshot(const StoreMeta& meta, const model::Registry& registry) {
   ByteWriter payload;
   model::encode_registry(registry, payload, true);
-  if (payload.size() > limits::kMaxStoreRecordPayload) {
-    return Status::make(Outcome::CapacityExceeded, "snapshot payload exceeds the maximum record size");
+  if (payload.size() > kMaxSnapshotPayload) {
+    return Status::make(Outcome::CapacityExceeded, "snapshot payload exceeds the maximum store size");
   }
 
   std::vector<std::byte> bytes(kSnapshotHeaderSize + payload.size() + 4, std::byte{0});
@@ -99,8 +104,8 @@ Result<Snapshot> decode_snapshot(std::span<const std::byte> bytes) {
     return Status::make(Outcome::Corrupt, "snapshot header CRC32C mismatch");
   }
   const std::uint32_t payload_length = get_u32(bytes.data() + 12);
-  if (payload_length > limits::kMaxStoreRecordPayload) {
-    return Status::make(Outcome::CapacityExceeded, "snapshot payload exceeds the maximum record size");
+  if (payload_length > kMaxSnapshotPayload) {
+    return Status::make(Outcome::CapacityExceeded, "snapshot payload exceeds the maximum store size");
   }
   std::size_t total = 0;
   if (!checked::add_size(kSnapshotHeaderSize, payload_length, total) || !checked::add_size(total, 4, total)) {
@@ -150,7 +155,7 @@ Status save_snapshot(const std::string& path, const StoreMeta& meta, const model
 }
 
 Result<Snapshot> load_snapshot(const std::string& path) {
-  Result<std::vector<std::byte>> bytes = read_file_bounded(path, limits::kMaxStoreRecordPayload + kSnapshotHeaderSize + 4);
+  Result<std::vector<std::byte>> bytes = read_file_bounded(path, kMaxSnapshotPayload + kSnapshotHeaderSize + 4);
   if (!bytes) {
     return bytes.status();
   }

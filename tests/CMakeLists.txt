@@ -20,7 +20,7 @@ icf_add_test(icf_policy_tests unit/policy_tests.cpp)
 icf_add_test(icf_property_tests property/property_tests.cpp)
 icf_add_test(icf_differential_tests differential/differential_tests.cpp)
 icf_add_test(icf_adversarial_tests adversarial/adversarial_tests.cpp)
-icf_add_test(icf_net_tests net/net_tests.cpp)
+icf_add_test(icf_net_tests net/net_tests.cpp net/coordinator_tests.cpp)
 icf_add_test(icf_concurrency_tests net/concurrency_tests.cpp)
 
 icf_add_test(icf_multiprocess_tests integration/multiprocess_tests.cpp)

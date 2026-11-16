@@ -1,12 +1,25 @@
 #include "icf/runtime/fencing.hpp"
 
 #include <string>
+#include <utility>
 
 #include "icf/core/limits.hpp"
 #include "icf/runtime/audit.hpp"
 
 namespace icf::runtime {
 namespace {
+
+// The audit trail is bounded and stops growing at its bound; the coordinator and the agent apply
+// the same rule to their own records. A full trail must never stop a fence: withdrawing authority
+// is the state change, the record of it is not.
+Status record_fence(model::Registry& registry, Timestamp at, const std::string& actor, std::string action,
+                    std::string subject, std::string detail) {
+  if (registry.audit().size() >= limits::kMaxAuditRecords) {
+    return Status::ok();
+  }
+  return append_audit(registry, at, actor, std::move(action), std::move(subject), Outcome::Fenced,
+                      std::move(detail));
+}
 
 // Returns the endpoint record's cluster so the caller can update the reservation counters.
 void release_reservation(model::Registry& registry, model::ReservationRecord& reservation, Timestamp at,
@@ -76,8 +89,8 @@ Result<FenceOutcome> apply_fence_plan(model::Registry& registry, const model::Fe
           // revision advances so that observers can order the fencing against other updates
         }
         ++outcome.grants_fenced;
-        const Status audited = append_audit(registry, at, actor, "fence-grant",
-                                            std::string("grant=") + grant->id.to_string(), Outcome::Fenced,
+        const Status audited = record_fence(registry, at, actor, "fence-grant",
+                                            std::string("grant=") + grant->id.to_string(),
                                             std::string(to_string(plan.trigger)));
         if (!audited) {
           return audited;
@@ -100,8 +113,8 @@ Result<FenceOutcome> apply_fence_plan(model::Registry& registry, const model::Fe
           // revision advances so ordering is observable
         }
         ++outcome.contracts_fenced;
-        const Status audited = append_audit(registry, at, actor, "fence-contract",
-                                            std::string("contract=") + contract->id.to_string(), Outcome::Fenced,
+        const Status audited = record_fence(registry, at, actor, "fence-contract",
+                                            std::string("contract=") + contract->id.to_string(),
                                             std::string(to_string(plan.trigger)));
         if (!audited) {
           return audited;

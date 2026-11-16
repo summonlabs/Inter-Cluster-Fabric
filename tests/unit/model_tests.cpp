@@ -254,3 +254,96 @@ ICF_TEST(model, audit_sequence_is_contiguous_and_bounded) {
   second.sequence = Sequence(6);
   ICF_EXPECT_OK(fixture.registry.append_audit(second));
 }
+
+ICF_TEST(model, finished_grants_make_room_when_the_grant_table_is_full) {
+  // Every grant ever issued stays in the table once it has ended. When the table is full, the
+  // oldest ended grants that hold no capacity make room; nothing that is live or still holds a
+  // reservation is touched.
+  Rng rng(19);
+  PairFixture fixture = make_authorized_pair(rng);
+  authorize_pair(fixture, rng);
+  const model::GrantRecord live = *fixture.registry.find_grant(fixture.grant);
+
+  model::GrantRecord ended = live;
+  ended.state = model::GrantState::Expired;
+  GrantId oldest_holding;
+  GrantId oldest_released;
+  GrantId newest;
+  std::int64_t issued = 0;
+  while (fixture.registry.grants().size() < limits::kMaxGrants) {
+    ended.id = GrantId::random(rng);
+    ended.issued_at = Timestamp::from_unix_nanos(++issued);
+    ended.valid_until = ended.issued_at;
+    ICF_ASSERT_OK(fixture.registry.put_grant(ended));
+    if (issued == 1) {
+      oldest_holding = ended.id;
+    } else if (issued == 2) {
+      oldest_released = ended.id;
+    }
+    newest = ended.id;
+  }
+  model::ReservationRecord holding;
+  holding.id = ReservationId::random(rng);
+  holding.grant = oldest_holding;
+  holding.endpoint = fixture.source.endpoint;
+  holding.cluster = fixture.source.cluster.id;
+  holding.amount = CapacityUnits(5);
+  ICF_ASSERT_OK(fixture.registry.put_reservation(holding));
+  model::ReservationRecord released = holding;
+  released.id = ReservationId::random(rng);
+  released.grant = oldest_released;
+  released.released = true;
+  ICF_ASSERT_OK(fixture.registry.put_reservation(released));
+
+  model::GrantRecord fresh = live;
+  fresh.id = GrantId::random(rng);
+  fresh.state = model::GrantState::Preparing;
+  fresh.issued_at = Timestamp::from_unix_nanos(issued + 1);
+  fresh.valid_until = fresh.issued_at;
+  ICF_ASSERT_OK(fixture.registry.put_grant(fresh));
+
+  ICF_EXPECT_TRUE(fixture.registry.find_grant(fresh.id) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_grant(live.id) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_grant(oldest_holding) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_reservation(holding.id) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_grant(oldest_released) == nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_reservation(released.id) == nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_grant(newest) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.grants().size() <= limits::kMaxGrants);
+  ICF_EXPECT_OK(fixture.registry.validate());
+}
+
+ICF_TEST(model, released_reservations_make_room_when_the_reservation_table_is_full) {
+  // Two reservations are taken for every commit and stay in the table after their release.
+  Rng rng(20);
+  PairFixture fixture = make_authorized_pair(rng);
+  authorize_pair(fixture, rng);
+  model::ReservationRecord reservation;
+  reservation.grant = fixture.grant;
+  reservation.endpoint = fixture.source.endpoint;
+  reservation.cluster = fixture.source.cluster.id;
+  reservation.amount = CapacityUnits(5);
+  reservation.id = ReservationId::random(rng);
+  const ReservationId held = reservation.id;
+  ICF_ASSERT_OK(fixture.registry.put_reservation(reservation));
+  reservation.released = true;
+  std::int64_t released_at = 0;
+  while (fixture.registry.reservations().size() < limits::kMaxReservations) {
+    reservation.id = ReservationId::random(rng);
+    reservation.released_at = Timestamp::from_unix_nanos(++released_at);
+    ICF_ASSERT_OK(fixture.registry.put_reservation(reservation));
+  }
+  const ReservationId newest_released = reservation.id;
+
+  model::ReservationRecord fresh = reservation;
+  fresh.id = ReservationId::random(rng);
+  fresh.released = false;
+  fresh.released_at = Timestamp{};
+  ICF_ASSERT_OK(fixture.registry.put_reservation(fresh));
+
+  ICF_EXPECT_TRUE(fixture.registry.find_reservation(fresh.id) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_reservation(held) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.find_reservation(newest_released) != nullptr);
+  ICF_EXPECT_TRUE(fixture.registry.reservations().size() <= limits::kMaxReservations);
+  ICF_EXPECT_OK(fixture.registry.validate());
+}

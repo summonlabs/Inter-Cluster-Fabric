@@ -4,6 +4,36 @@
 #include "icf/store/file_util.hpp"
 
 namespace icf::store {
+namespace {
+
+// A log is replaced only after the snapshot that covers it is written. When the process stops
+// between the two, the old log is replayed over a snapshot that already holds every record in
+// it. Such a record changes nothing: an audit record the trail already holds, the removal of a
+// record that is already gone, and the reservation of a grant that has since been discarded.
+bool already_in_snapshot(const model::Registry& registry, const Mutation& mutation) {
+  switch (mutation.kind) {
+    case MutationKind::AuditAppend:
+      return !registry.audit().empty() && !(registry.audit().back().sequence < mutation.audit.sequence);
+    case MutationKind::ClusterErase:
+      return registry.find_cluster(mutation.cluster.id) == nullptr;
+    case MutationKind::LinkErase:
+      return registry.find_link(mutation.link.id) == nullptr;
+    case MutationKind::PathErase:
+      return registry.find_path(mutation.path.id) == nullptr;
+    case MutationKind::PolicyErase:
+      return registry.policies().find(mutation.policy.id) == registry.policies().end();
+    case MutationKind::ContractErase:
+      return registry.find_contract(mutation.contract.id) == nullptr;
+    case MutationKind::GrantErase:
+      return registry.find_grant(mutation.grant.id) == nullptr;
+    case MutationKind::ReservationPut:
+      return registry.find_grant(mutation.reservation.grant) == nullptr;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
 
 std::string DurableStore::snapshot_path() const { return join_path(options_.directory, options_.snapshot_name); }
 
@@ -57,6 +87,9 @@ Result<DurableStore> DurableStore::open(const Options& options, Recovery& recove
         if (mutation.value().kind == MutationKind::MetaSet) {
           recovery.meta.term = mutation.value().meta_term;
           recovery.meta.incarnation = mutation.value().meta_incarnation;
+          return Status::ok();
+        }
+        if (recovery.snapshot_loaded && already_in_snapshot(recovery.registry, mutation.value())) {
           return Status::ok();
         }
         const Status applied = apply_mutation(recovery.registry, mutation.value());

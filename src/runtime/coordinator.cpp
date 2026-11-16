@@ -29,6 +29,31 @@ Status send_to(net::Connection* connection, wire::MessageType type, const Messag
 constexpr std::uint64_t kVirtualConnection = 0;
 constexpr Duration kTickInterval = Duration::from_millis(500);
 
+// The reservation counters of an endpoint scope are the coordinator's own accounting. A record
+// that replaces a cluster (an agent's report, an operator's upsert) never carries them, so they
+// are taken over from the record it replaces. Without this every report would hand the reserved
+// capacity out a second time.
+void keep_reserved_capacity(const model::ClusterRecord* current, model::ClusterRecord& incoming) {
+  for (model::EndpointRecord& endpoint : incoming.endpoints) {
+    endpoint.reserved = CapacityUnits{};
+    if (current == nullptr) {
+      continue;
+    }
+    for (const model::EndpointRecord& held : current->endpoints) {
+      if (held.id == endpoint.id) {
+        endpoint.reserved = held.reserved;
+        break;
+      }
+    }
+  }
+}
+
+// A grant in one of these states has ended: nothing brings it back, and no agent may enforce it.
+bool grant_ended(model::GrantState state) noexcept {
+  return state == model::GrantState::Fenced || state == model::GrantState::Aborted ||
+         state == model::GrantState::Expired || state == model::GrantState::Withdrawn;
+}
+
 }  // namespace
 
 Coordinator::Coordinator(Config config, const Clock& clock)
@@ -89,6 +114,7 @@ Status Coordinator::begin_incarnation() {
 
   if (recovery_.recovered_from_store) {
     // Everything dynamic that survived the restart is historical. Fence it before serving.
+    const std::size_t audit_before = registry_.audit().size();
     Result<FenceOutcome> fenced =
         fence_recovered_state(registry_, started_at_, "coordinator-recovery", previous_incarnation_, term_);
     if (!fenced) {
@@ -124,6 +150,17 @@ Status Coordinator::begin_incarnation() {
       store::Mutation mutation;
       mutation.kind = store::MutationKind::ClusterPut;
       mutation.cluster = entry.second;
+      const Status appended = append_mutation(mutation);
+      if (!appended) {
+        return appended;
+      }
+    }
+    // The fence recorded what it did in the audit trail. Those records are written too: the next
+    // record continues their sequence, and a log with a gap in it cannot be replayed.
+    for (std::size_t index = audit_before; index < registry_.audit().size(); ++index) {
+      store::Mutation mutation;
+      mutation.kind = store::MutationKind::AuditAppend;
+      mutation.audit = registry_.audit()[index];
       const Status appended = append_mutation(mutation);
       if (!appended) {
         return appended;
@@ -386,33 +423,27 @@ void Coordinator::handle_disconnect(std::uint64_t connection_id, const Status& r
     return;
   }
   // Any grant flow that was waiting on this peer becomes indeterminate: it is not usable until a
-  // fresh status exchange resolves it.
+  // fresh status exchange resolves it. Only the flows that run on this connection are affected:
+  // a cluster may have a newer session, and the close of the one it replaced says nothing about
+  // the flows that run on the newer one.
+  std::vector<GrantId> interrupted;
   for (auto& entry : pending_) {
     PendingGrant& pending = entry.second;
     for (std::size_t side = 0; side < model::kPartyCount; ++side) {
-      if (pending.targets[side].connection_id == connection_id) {
+      if (pending.targets[side].connected && pending.targets[side].connection_id == connection_id) {
         pending.targets[side].connected = false;
         pending.targets[side].connection_id = 0;
+        interrupted.push_back(pending.grant);
       }
     }
-    (void)pending;
   }
-  for (auto& entry : registry_.grants()) {
-    model::GrantRecord& grant = entry.second;
+  for (const GrantId& grant_id : interrupted) {
+    model::GrantRecord* found = registry_.find_grant(grant_id);
+    if (found == nullptr) {
+      continue;
+    }
+    model::GrantRecord& grant = *found;
     if (grant.state != model::GrantState::Preparing && grant.state != model::GrantState::Prepared) {
-      continue;
-    }
-    const model::ContractRecord* contract = registry_.find_contract(grant.contract);
-    if (contract == nullptr) {
-      continue;
-    }
-    bool touches = false;
-    for (const model::PartyRef& party : contract->parties) {
-      if (party.cluster == cluster) {
-        touches = true;
-      }
-    }
-    if (!touches) {
       continue;
     }
     grant.state = model::GrantState::Indeterminate;
@@ -774,6 +805,7 @@ Status Coordinator::on_report_cluster(std::uint64_t connection_id, const wire::F
   incoming.provenance.session = session->token;
   incoming.incarnation_changes = cluster->incarnation_changes;
   incoming.generation_conflict = false;
+  keep_reserved_capacity(cluster, incoming);
   const Status stored = registry_.put_cluster(incoming);
   if (!stored) {
     return send_error(connection_id, Uuid{}, stored.outcome(), stored.message());
@@ -1049,6 +1081,31 @@ Status Coordinator::reserve_capacity(const model::GrantRecord& grant, Timestamp 
   if (contract == nullptr) {
     return not_found("the grant references an unknown contract");
   }
+  // Both sides are checked before either is charged. A refusal on the second side would
+  // otherwise leave the first side's capacity reserved for a grant that is then abandoned.
+  for (std::size_t side = 0; side < model::kPartyCount; ++side) {
+    const model::PartyRef& party = contract->parties[side];
+    const model::ClusterRecord* cluster = registry_.find_cluster(party.cluster);
+    if (cluster == nullptr) {
+      return not_found("a bound cluster is not registered");
+    }
+    const model::EndpointRecord* endpoint = nullptr;
+    for (const model::EndpointRecord& candidate : cluster->endpoints) {
+      if (candidate.id == party.endpoint) {
+        endpoint = &candidate;
+        break;
+      }
+    }
+    if (endpoint == nullptr) {
+      return not_found("a bound endpoint scope is not registered");
+    }
+    const std::uint64_t requested = grant.capacity.value();
+    if (requested > endpoint->capacity.value() ||
+        endpoint->reserved.value() > endpoint->capacity.value() - requested) {
+      return Status::make(Outcome::CapacityExceeded,
+                          std::string("endpoint scope ") + endpoint->id.str() + " cannot reserve the requested capacity");
+    }
+  }
   for (std::size_t side = 0; side < model::kPartyCount; ++side) {
     const model::PartyRef& party = contract->parties[side];
     model::ClusterRecord* cluster = registry_.find_cluster(party.cluster);
@@ -1148,7 +1205,8 @@ Status Coordinator::abort_grant(const GrantId& grant_id, const std::string& reas
     pending_.erase(grant_id);
     return Status::ok();
   }
-  if (grant->state == model::GrantState::Fenced || grant->state == model::GrantState::Withdrawn) {
+  if (grant->state == model::GrantState::Fenced || grant->state == model::GrantState::Withdrawn ||
+      grant->state == model::GrantState::Aborted) {
     pending_.erase(grant_id);
     return Status::ok();
   }
@@ -1161,6 +1219,22 @@ Status Coordinator::abort_grant(const GrantId& grant_id, const std::string& reas
   pending_.erase(grant_id);
   if (!persisted) {
     return persisted;
+  }
+  // An agent that prepared this attempt, or already enforces it, keeps it until it is told
+  // otherwise. A side that is not connected now is told when it reports its enforcement.
+  if (const model::ContractRecord* contract = registry_.find_contract(grant->contract); contract != nullptr) {
+    for (const model::PartyRef& party : contract->parties) {
+      const SendTarget target = target_for(party.cluster);
+      if (!target.connected) {
+        continue;
+      }
+      wire::AbortGrantMessage message;
+      message.session = target.token;
+      message.grant = grant_id;
+      message.attempt = grant->attempt;
+      message.reason = reason;
+      (void)send_to(connection_for(target.connection_id), wire::MessageType::AbortGrant, message);
+    }
   }
   return append_audit("coordinator", "abort-grant", grant_id.to_string(), Outcome::Cancelled, reason);
 }
@@ -1353,6 +1427,12 @@ Status Coordinator::on_grant_committed(std::uint64_t connection_id, const wire::
     return send_error(connection_id, Uuid{}, Outcome::Stale,
                       "the acknowledgement comes from a superseded incarnation or generation");
   }
+  if (grant->state != model::GrantState::Prepared && grant->state != model::GrantState::Indeterminate) {
+    // Only an attempt whose commit is outstanding takes an acknowledgement. One that arrives
+    // after the grant was fenced, aborted, or expired must not bring the grant back.
+    return send_error(connection_id, Uuid{}, Outcome::Conflicting,
+                      "the grant is no longer accepting commit acknowledgements");
+  }
   if (!committed.value().installed) {
     const Status aborted = abort_grant(grant->id, committed.value().detail);
     if (!aborted) {
@@ -1387,7 +1467,26 @@ Status Coordinator::on_grant_aborted(std::uint64_t connection_id, const wire::Fr
   if (!authorized) {
     return send_error(connection_id, Uuid{}, authorized.outcome(), authorized.message());
   }
-  return abort_grant(aborted.value().grant, aborted.value().reason);
+  model::GrantRecord* grant = registry_.find_grant(aborted.value().grant);
+  if (grant == nullptr) {
+    return Status::ok();
+  }
+  const model::ContractRecord* contract = registry_.find_contract(grant->contract);
+  if (session->role != wire::PeerRole::Agent || contract == nullptr || contract->side_of(session->cluster) < 0) {
+    return send_error(connection_id, Uuid{}, Outcome::Unauthorized, "the grant does not involve this cluster");
+  }
+  if (aborted.value().attempt != grant->attempt) {
+    ++rejected_replays_;
+    return send_error(connection_id, Uuid{}, Outcome::Replayed, "the message names a different attempt");
+  }
+  if (grant->state != model::GrantState::Preparing && grant->state != model::GrantState::Prepared &&
+      grant->state != model::GrantState::Indeterminate) {
+    // The answer to an abort this coordinator sent, or a message that arrives after the attempt
+    // was committed or ended. Nothing is left to abandon: a committed grant holds reservations,
+    // and ending it is the business of a fence, which releases them.
+    return Status::ok();
+  }
+  return abort_grant(grant->id, aborted.value().reason);
 }
 
 Status Coordinator::on_fence_ack(std::uint64_t connection_id, const wire::Frame& frame) {
@@ -1485,9 +1584,33 @@ Status Coordinator::on_status_report(std::uint64_t connection_id, const wire::Fr
     return send_error(connection_id, Uuid{}, authorized.outcome(), authorized.message());
   }
   ++revalidations_;
+  // An agent that was not connected when a grant was fenced, aborted, or expired never heard of
+  // it and goes on enforcing the grant. Whatever it reports as installed that this coordinator
+  // has ended, or holds no record of, is withdrawn from it here.
+  std::vector<GrantId> withdrawn;
+  for (const wire::GrantStatusEntry& reported : report.value().grants) {
+    if (reported.state != model::GrantState::Committed && reported.state != model::GrantState::Active) {
+      continue;
+    }
+    const model::GrantRecord* known = registry_.find_grant(reported.grant);
+    if (known == nullptr || grant_ended(known->state)) {
+      withdrawn.push_back(reported.grant);
+    }
+  }
+  if (!withdrawn.empty()) {
+    wire::FenceMessage fence;
+    fence.session = session->token;
+    fence.coordinator_term = term_;
+    fence.grants = withdrawn;
+    fence.reason = "the coordinator ended these grants; they are no longer authorized";
+    (void)send_to(connection_for(connection_id), wire::MessageType::Fence, fence);
+  }
   std::vector<GrantId> to_fence;
   for (auto& entry : registry_.grants()) {
     model::GrantRecord& grant = entry.second;
+    if (grant_ended(grant.state)) {
+      continue;
+    }
     const model::ContractRecord* contract = registry_.find_contract(grant.contract);
     if (contract == nullptr) {
       continue;
@@ -2275,6 +2398,7 @@ Status Coordinator::handle_admin(const wire::AdminMessage& request, wire::AdminR
       record.provenance.source = model::EvidenceSource::AdminConfigured;
       record.provenance.verification = model::VerificationState::Verified;
       record.provenance.observed_at = clock_->now();
+      keep_reserved_capacity(registry_.find_cluster(record.id), record);
       status = registry_.put_cluster(record);
       if (status) {
         store::Mutation mutation;
@@ -2288,11 +2412,15 @@ Status Coordinator::handle_admin(const wire::AdminMessage& request, wire::AdminR
       break;
     }
     case wire::AdminAction::DeleteCluster: {
+      // The log record of a removal carries the whole record it removes. A record that held
+      // only the identity could not be decoded again, and the store would not open.
+      store::Mutation mutation;
+      mutation.kind = store::MutationKind::ClusterErase;
+      if (const model::ClusterRecord* existing = registry_.find_cluster(request.cluster_id); existing != nullptr) {
+        mutation.cluster = *existing;
+      }
       status = registry_.erase_cluster(request.cluster_id);
       if (status) {
-        store::Mutation mutation;
-        mutation.kind = store::MutationKind::ClusterErase;
-        mutation.cluster.id = request.cluster_id;
         status = append_mutation(mutation);
       }
       break;
@@ -2375,11 +2503,13 @@ Status Coordinator::handle_admin(const wire::AdminMessage& request, wire::AdminR
       break;
     }
     case wire::AdminAction::DeleteLink: {
+      store::Mutation mutation;
+      mutation.kind = store::MutationKind::LinkErase;
+      if (const model::LinkRecord* existing = registry_.find_link(request.edge); existing != nullptr) {
+        mutation.link = *existing;
+      }
       status = registry_.erase_link(request.edge);
       if (status) {
-        store::Mutation mutation;
-        mutation.kind = store::MutationKind::LinkErase;
-        mutation.link.id = request.edge;
         status = append_mutation(mutation);
       }
       break;
@@ -2405,11 +2535,14 @@ Status Coordinator::handle_admin(const wire::AdminMessage& request, wire::AdminR
       break;
     }
     case wire::AdminAction::DeletePath: {
-      status = registry_.erase_path(request.edge.empty() ? PathId{} : PathId::unchecked(request.edge.str()));
+      const PathId path = request.edge.empty() ? PathId{} : PathId::unchecked(request.edge.str());
+      store::Mutation mutation;
+      mutation.kind = store::MutationKind::PathErase;
+      if (const model::PathRecord* existing = registry_.find_path(path); existing != nullptr) {
+        mutation.path = *existing;
+      }
+      status = registry_.erase_path(path);
       if (status) {
-        store::Mutation mutation;
-        mutation.kind = store::MutationKind::PathErase;
-        mutation.path.id = PathId::unchecked(request.edge.str());
         status = append_mutation(mutation);
       }
       break;
@@ -2454,11 +2587,13 @@ Status Coordinator::handle_admin(const wire::AdminMessage& request, wire::AdminR
       break;
     }
     case wire::AdminAction::DeletePolicy: {
+      store::Mutation mutation;
+      mutation.kind = store::MutationKind::PolicyErase;
+      if (const auto existing = registry_.policies().find(request.policy_id); existing != registry_.policies().end()) {
+        mutation.policy = existing->second;
+      }
       status = registry_.erase_policy(request.policy_id);
       if (status) {
-        store::Mutation mutation;
-        mutation.kind = store::MutationKind::PolicyErase;
-        mutation.policy.id = request.policy_id;
         status = append_mutation(mutation);
       }
       break;

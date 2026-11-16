@@ -416,3 +416,40 @@ ICF_TEST(engine, decision_is_deterministic_across_repeated_evaluation) {
     ICF_EXPECT_EQ(first.reasons.size(), again.reasons.size());
   }
 }
+
+ICF_TEST(engine, a_full_audit_trail_never_stops_a_fence) {
+  // The trail is bounded and stops growing at its bound. Withdrawing authority must still happen:
+  // every recovered grant is fenced and every reservation is released.
+  Rng rng(67);
+  PairFixture fixture = make_authorized_pair(rng);
+  authorize_pair(fixture, rng);
+  model::ClusterRecord holding = fixture.source.cluster;
+  holding.endpoints[0].reserved = CapacityUnits(500);
+  ICF_ASSERT_OK(fixture.registry.put_cluster(holding));
+  model::ReservationRecord reservation;
+  reservation.id = ReservationId::random(rng);
+  reservation.grant = fixture.grant;
+  reservation.endpoint = fixture.source.endpoint;
+  reservation.cluster = fixture.source.cluster.id;
+  reservation.amount = CapacityUnits(500);
+  reservation.created_at = fixture.now;
+  ICF_ASSERT_OK(fixture.registry.put_reservation(reservation));
+  for (std::size_t index = 0; index < limits::kMaxAuditRecords; ++index) {
+    model::AuditRecord record;
+    record.sequence = Sequence(static_cast<std::uint64_t>(index + 1));
+    record.actor = "agent";
+    record.action = "report-cluster";
+    record.subject = "cluster-a";
+    ICF_ASSERT_OK(fixture.registry.append_audit(record));
+  }
+
+  Result<runtime::FenceOutcome> outcome =
+      runtime::fence_recovered_state(fixture.registry, fixture.now, "test", IncarnationId{}, fixture.term);
+  ICF_ASSERT_OK(outcome.status());
+  ICF_EXPECT_EQ(1ull, outcome.value().grants_fenced);
+  ICF_EXPECT_EQ(1ull, outcome.value().reservations_released);
+  ICF_EXPECT_EQ(model::GrantState::Fenced, fixture.registry.find_grant(fixture.grant)->state);
+  ICF_EXPECT_TRUE(fixture.registry.find_reservation(reservation.id)->released);
+  ICF_EXPECT_EQ(0ull, fixture.registry.find_cluster(fixture.source.cluster.id)->endpoints[0].reserved.value());
+  ICF_EXPECT_EQ(static_cast<std::size_t>(limits::kMaxAuditRecords), fixture.registry.audit().size());
+}

@@ -433,3 +433,129 @@ ICF_TEST(durable_store, mutation_validation_rejects_inconsistent_state) {
   link_without_endpoints.link.id = EdgeId::parse("edge").value();
   ICF_EXPECT_OUTCOME(Outcome::Invalid, store::validate_mutation(registry, link_without_endpoints));
 }
+
+namespace {
+
+// Appends `count` audit records of ordinary size to the trail.
+void fill_audit(model::Registry& registry, std::size_t count) {
+  const std::size_t first = registry.audit().size();
+  for (std::size_t index = first; index < first + count; ++index) {
+    model::AuditRecord record;
+    record.sequence = Sequence(static_cast<std::uint64_t>(index + 1));
+    record.at = Timestamp::from_unix_nanos(static_cast<std::int64_t>(index));
+    record.actor = "agent";
+    record.action = "report-cluster";
+    record.subject = "cluster-" + std::to_string(index);
+    record.outcome = Outcome::Ok;
+    record.detail = "generation=" + std::to_string(index);
+    (void)registry.append_audit(record);
+  }
+}
+
+}  // namespace
+
+ICF_TEST(durable_store, a_state_larger_than_one_log_record_is_compacted_and_recovered) {
+  // The audit trail alone may hold 65,536 records, so a state of ordinary size is several times
+  // the size of one log record. Compaction and recovery must carry all of it.
+  TempDir directory("store-large-state");
+  Rng rng(46);
+  PairFixture fixture = make_authorized_pair(rng);
+  authorize_pair(fixture, rng);
+  fill_audit(fixture.registry, 20000);
+  ByteWriter encoded;
+  model::encode_registry(fixture.registry, encoded, true);
+  ICF_ASSERT_TRUE(encoded.size() > limits::kMaxStoreRecordPayload);
+
+  store::DurableStore::Options options;
+  options.directory = directory.path();
+  options.snapshot_name = "large.snapshot";
+  options.wal_name = "large.wal";
+  {
+    store::DurableStore::Recovery recovery;
+    Result<store::DurableStore> store = store::DurableStore::open(options, recovery);
+    ICF_ASSERT_OK(store.status());
+    store::Mutation mutation;
+    mutation.kind = store::MutationKind::ClusterPut;
+    mutation.cluster = fixture.source.cluster;
+    ICF_ASSERT_OK(store.value().append(mutation, Timestamp::from_unix_nanos(1)).status());
+    store::StoreMeta meta;
+    meta.term = Term(3);
+    ICF_ASSERT_OK(store.value().compact(fixture.registry, meta, Timestamp::from_unix_nanos(2)));
+    ICF_EXPECT_EQ(0ull, store.value().wal_records());
+  }
+  store::DurableStore::Recovery second;
+  Result<store::DurableStore> reopened = store::DurableStore::open(options, second);
+  ICF_ASSERT_OK(reopened.status());
+  ICF_EXPECT_TRUE(second.snapshot_loaded);
+  ICF_EXPECT_EQ(fixture.registry.digest(), second.registry.digest());
+  ICF_EXPECT_EQ(static_cast<std::size_t>(20000), second.registry.audit().size());
+}
+
+ICF_TEST(durable_store, a_log_already_folded_into_the_snapshot_is_recovered) {
+  // The process stops after the snapshot is written and before the log is replaced. The log is
+  // then replayed over a snapshot that already holds every record in it.
+  TempDir directory("store-folded-log");
+  Rng rng(47);
+  PairFixture fixture = make_authorized_pair(rng);
+  store::DurableStore::Options options;
+  options.directory = directory.path();
+  options.snapshot_name = "folded.snapshot";
+  options.wal_name = "folded.wal";
+
+  model::Registry registry;
+  {
+    store::DurableStore::Recovery recovery;
+    Result<store::DurableStore> store = store::DurableStore::open(options, recovery);
+    ICF_ASSERT_OK(store.status());
+    std::int64_t at = 1;
+    const auto apply = [&](const store::Mutation& mutation) {
+      ICF_ASSERT_OK(store::apply_mutation(registry, mutation));
+      ICF_ASSERT_OK(store.value().append(mutation, Timestamp::from_unix_nanos(at++)).status());
+    };
+    store::Mutation mutation;
+    mutation.kind = store::MutationKind::ClusterPut;
+    mutation.cluster = fixture.source.cluster;
+    apply(mutation);
+    mutation.cluster = fixture.target.cluster;
+    apply(mutation);
+    // A rule that is added and removed again within the same log.
+    mutation = store::Mutation{};
+    mutation.kind = store::MutationKind::PolicyPut;
+    mutation.policy = allow_rule("temporary", "domain-north", fixture.source.cluster.id, fixture.target.cluster.id, 2);
+    apply(mutation);
+    mutation.kind = store::MutationKind::PolicyErase;
+    apply(mutation);
+    for (std::uint64_t sequence = 1; sequence <= 3; ++sequence) {
+      mutation = store::Mutation{};
+      mutation.kind = store::MutationKind::AuditAppend;
+      mutation.audit.sequence = Sequence(sequence);
+      mutation.audit.actor = "operator";
+      mutation.audit.action = "upsert-cluster";
+      mutation.audit.subject = "cluster-a";
+      apply(mutation);
+    }
+    store::StoreMeta meta;
+    meta.term = Term(2);
+    meta.sequence = store.value().last_sequence();
+    ICF_ASSERT_OK(store::save_snapshot(store.value().snapshot_path(), meta, registry));
+  }
+
+  store::DurableStore::Recovery second;
+  Result<store::DurableStore> reopened = store::DurableStore::open(options, second);
+  ICF_ASSERT_OK(reopened.status());
+  ICF_EXPECT_EQ(registry.digest(), second.registry.digest());
+  ICF_EXPECT_EQ(static_cast<std::size_t>(3), second.registry.audit().size());
+  ICF_EXPECT_TRUE(second.registry.policies().empty());
+
+  // The trail continues where it ended.
+  store::Mutation next;
+  next.kind = store::MutationKind::AuditAppend;
+  next.audit.sequence = Sequence(4);
+  next.audit.actor = "operator";
+  next.audit.action = "upsert-cluster";
+  next.audit.subject = "cluster-b";
+  ICF_ASSERT_OK(reopened.value().append(next, Timestamp::from_unix_nanos(100)).status());
+  store::DurableStore::Recovery third;
+  ICF_ASSERT_OK(store::DurableStore::open(options, third).status());
+  ICF_EXPECT_EQ(static_cast<std::size_t>(4), third.registry.audit().size());
+}
